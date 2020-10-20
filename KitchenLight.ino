@@ -1,31 +1,205 @@
 /*
  * Плавное включение и выключение подсветки кухонной зоны
- * by Welcome
+ * by Sergey Lipatnikov
  * 
- * v.0.1 - 17.10.2020
+ * v01 - 17.10.2020
  * Реализация ШИМ на встроенном светодиоде
- * analogWrite 0-1023
- * Логика инверсная: 0 = max, 1023 = min
+ * ШИМ реализуется встроенной функцией analogWrite 
+ * Диапазон ШИМ: 0-1023, логика инверсная: 0 = max, 1023 = min
+ * 
+ * v02 - 18.10.2020
+ * добавлены датчики движения
+ * 
+ * v03 - 20/10/2020
+ * добавлены сетевые функции
+ * Добавлены функции управления ШИМ по заданной яркости
+ * добавлено управление через MQTT
  */
-#define LED_PIN 2
 
-//const int linearPwmPoints[] = {0,1,2,4,8,16,32,64,128,256,512,1023};
-const int linearPwmPoints[] = {0,1,3,5,8,13,21,34,55,89,144,233,377,610,987}; //Fibonachi
+#define PIN_motion_sensor1  0  // пин подключения датчика движения №1
+#define PIN_motion_sensor2  1  // пин подключения датчика движения №2
+#define PIN_led_strip       2  // пин ШИМ-сигнала для светодиодной ленты
+#define PIN_light_sensor    3  // пин подключения датчика света
+
+#define  OFF          0
+#define  ON           100
+#define  NIGHT_LIGHT  15
 
 
+#include <ESP8266WiFi.h>
+const char ssid[] = "welcome's wi-fi";
+const char pass[] = "27101988";
+const bool NEED_STATIC_IP = true;
+IPAddress IP_KitchenLight      (192, 168, 1, 83);  
+IPAddress IP_Node_MCU          (192, 168, 1, 71);
+IPAddress IP_Fan_controller    (192, 168, 1, 41);
+IPAddress IP_Water_sensor_bath (192, 168, 1, 135); 
+IPAddress IP_Toilet_controller (192, 168, 1, 54);
+
+
+#include <ESP8266WebServer.h>
+#include <ESP8266HTTPUpdateServer.h>
+ESP8266WebServer httpServer(80);
+ESP8266HTTPUpdateServer httpUpdater;
+
+
+#include <PubSubClient.h>
+WiFiClient ESP_kitchenLight;
+PubSubClient client(ESP_kitchenLight);
+const char* mqtt_client_name = "ESP_kitchenLight";    // Имя клиента MQTT
+
+
+//переменные
+byte currentBrightnes = OFF;              // текущая яркость
+byte targetBrightnes = OFF;               // заданная яркость
+bool manual_mode_flag = false;            // признак управления через MQTT
+
+unsigned long LastOnlineTime;             // время когда модуль был онлайн
+unsigned long LastCheckTime;              // время крайней проверки подключения к сервисам
+unsigned long MotionTime;                 // время срабатывания датчика движения
+unsigned long LastStepTime;               // время крайнего измнения ШИМ ленты
+unsigned long ManualModeTime;             // время получения запроса через MQTT 
+
+// константы
+const int CHECK_PERIOD = 2 *  1000;   // периодичность проверки на подключение к сервисам
+const int RESTART_PERIOD = 30*60*1000;    // время до ребута, если не удается подключиться к wi-fi
+const int LIGHT_ON_TIME = 20 * 1000;      // длительность подсветки после пропадания движения
+const int PWM_TIME_STEP = 20;             // время изменения значения ШИМ 
+const int MANUAL_TIME = 30 * 1000;        // время в ручном режиме
+
+//const int  linearPwmPoints[] = {0,1,3,5,8,13,21,34,55,89,144,233,377,610,987}; // Ряд Фибоначи: нелинейный для линейного изменения яркости ленты
+const int  linearPwmPoints[] = {0,1,2,3,4,5,7,9,12,15,20,26,34,44,57,74,96,125,163,212,275,358,465,605,787,1023}; // y=x*1.3
+const byte iMaxBrightnes = sizeof(linearPwmPoints)/sizeof(int) - 1;            // максимальная яркость - индекс последнего элемента массива
+const byte iMinBrightnes = 0;                                                  // минимальная яркость - индекс первого элемента массива
+
+//топики 
+const char topicTargetBrt[] = "/sv.lipatnikov@gmail.com/light/targetBrt";
+const char topicTargetBrt_ctrl[] = "/sv.lipatnikov@gmail.com/light/targetBrt_ctrl";
+
+
+
+//=========================================================================================
 void setup() 
 {
-  pinMode(LED_PIN, OUTPUT);   
+  pinMode(PIN_led_strip, OUTPUT); 
+  pinMode(PIN_motion_sensor1, INPUT);  
+  pinMode(PIN_motion_sensor2, INPUT);  
+  pinMode(PIN_light_sensor, INPUT); 
+
+  Connect_WiFi(IP_KitchenLight, NEED_STATIC_IP);
+  Connect_OTA();            
+             
+  Connect_mqtt(mqtt_client_name);
+  MQTT_subscribe();
+  
+  StripLedControl(OFF); //выключаем ленту
 }
 
+//=========================================================================================
 void loop() 
 {
-  for (int i = 0; i <= (sizeof(linearPwmPoints)/sizeof(int)) - 1; i++) {
-    analogWrite(LED_PIN, 1023-linearPwmPoints[i]);
-    delay(100);
+  // сетевые функции
+  httpServer.handleClient();          // для обновления по воздуху   
+  client.loop();                      // для функций MQTT 
+
+  // проверка сигнала от датчиков движения
+  //bool motion_flag = Motion();
+
+  // сбрасываем флаг ручного режима через MANUAL_TIME
+  if ((long)millis() - ManualModeTime > MANUAL_TIME)
+    manual_mode_flag = false; 
+ 
+  // управление светодиодной лентой
+  if (manual_mode_flag)
+    StripLedControl(targetBrightnes);
+  else if (currentBrightnes == ON)
+    targetBrightnes = OFF;
+  else if (currentBrightnes == OFF)
+    targetBrightnes = ON;
+  StripLedControl(targetBrightnes);
+  
+  // проверка подключений к wifi и серверам
+  if ((long)millis() - LastCheckTime > CHECK_PERIOD) {
+    LastCheckTime = millis();     
+     
+    if (WiFi.status() != WL_CONNECTED) {   
+      Connect_WiFi(IP_KitchenLight, NEED_STATIC_IP); // WI-FI 
+      Connect_OTA();                                 // OTA
+      Restart(LastOnlineTime, RESTART_PERIOD);     
+    }
+    else 
+      LastOnlineTime = millis();    
+
+    if (!client.connected()) {            // MQTT
+      Connect_mqtt(mqtt_client_name);
+      MQTT_subscribe();
+    }     
   }
-  for (int i = (sizeof(linearPwmPoints)/sizeof(int)) - 1; i >= 0; i--) {
-    analogWrite(LED_PIN, 1023-linearPwmPoints[i]);
-    delay(100);
+}
+
+//=========================================================================================
+
+// функция определения движения
+bool Motion () {
+  if (digitalRead(PIN_motion_sensor1) || digitalRead(PIN_motion_sensor2)) { 
+    MotionTime = millis(); 
+    return true; 
+  }
+  if ((long)millis() - MotionTime < LIGHT_ON_TIME) 
+    return true;
+         
+  return false; // если не выполнились предыдущие условия
+}
+
+
+//=========================================================================================
+
+//функция управления светодиодной лентой
+void StripLedControl (byte newBrightnes) 
+{
+  if ((long)millis() - LastStepTime > PWM_TIME_STEP) {
+    LastStepTime = millis(); 
+
+    if (newBrightnes > currentBrightnes)
+      currentBrightnes++;
+      
+    if (newBrightnes < currentBrightnes) 
+      currentBrightnes--;
+      
+    byte index = GetLightIndex(currentBrightnes);
+    analogWrite(PIN_led_strip, 1023-linearPwmPoints[index]);
+  }
+}
+
+// функция преобразования яркости в процентах в индекс массива linearPwmPoints
+byte GetLightIndex (byte percent) {
+  byte index = (byte)((sizeof(linearPwmPoints) / sizeof(int)) * percent / 100 ); 
+  index = constrain(index, iMinBrightnes, iMaxBrightnes); // проверка на диапазон
+  return index;
+}
+
+
+//=========================================================================================
+//функции MQTT
+
+// функция подписки на топики 
+void MQTT_subscribe(void) {
+  client.subscribe(topicTargetBrt_ctrl);      
+}
+
+// получение данных от сервера
+void mqtt_get(char* topic, byte* payload, unsigned int length) {
+  // создаем копию полученных данных
+  char localPayload[length + 1];
+  for (int i=0; i<length; i++) { localPayload[i] = (char)payload[i]; }
+  localPayload[length] = 0;
+
+  // присваиваем переменным значения в зависимости от топика 
+  if (strcmp(topic, topicTargetBrt_ctrl) == 0) { 
+    int ivalue = 0; sscanf(localPayload, "%d", &ivalue);
+    targetBrightnes = (byte)ivalue;
+    manual_mode_flag = true;
+    ManualModeTime = millis(); 
+    MQTT_publish_int(topicTargetBrt, targetBrightnes); 
   }
 }
