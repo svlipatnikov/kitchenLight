@@ -2,28 +2,21 @@
  * Плавное включение и выключение подсветки кухонной зоны
  * by Sergey Lipatnikov
  * 
- * v01 - 17.10.2020
  * Реализация ШИМ на встроенном светодиоде
  * ШИМ реализуется встроенной функцией analogWrite 
- * Диапазон ШИМ: 0-1023, логика инверсная: 0 = max, 1023 = min
+ * Диапазон ШИМ: 0-1023
  * 
- * v02 - 18.10.2020
- * добавлены датчики движения
- * 
- * v03 - 20/10/2020
- * добавлены сетевые функции
- * Добавлены функции управления ШИМ по заданной яркости
- * добавлено управление через MQTT
  */
 
 #define PIN_motion_sensor1  0  // пин подключения датчика движения №1
 #define PIN_motion_sensor2  1  // пин подключения датчика движения №2
-#define PIN_led_strip       3  // пин ШИМ-сигнала для светодиодной ленты
 #define PIN_light_sensor    2  // пин подключения датчика света
+#define PIN_led_strip       3  // пин ШИМ-сигнала для светодиодной ленты
+
 
 #define  OFF          0
-#define  ON           100
 #define  NIGHT_LIGHT  25
+#define  DAY_LIGHT    100
 
 
 #include <ESP8266WiFi.h>
@@ -53,20 +46,25 @@ const char* mqtt_client_name = "ESP_kitchenLight";    // Имя клиента M
 //переменные
 byte currentBrightnes = OFF;              // текущая яркость
 byte targetBrightnes = OFF;               // заданная яркость
+byte manualBrightnes = OFF;               // яркость через mqtt
 bool manual_mode_flag = false;            // признак управления через MQTT
+bool motion_flag = false;                 // признак наличия движения
+bool night_flag = false;                  // признак ночи
 
-unsigned long LastOnlineTime;             // время когда модуль был онлайн
-unsigned long LastCheckTime;              // время крайней проверки подключения к сервисам
-unsigned long MotionTime;                 // время срабатывания датчика движения
-unsigned long LastStepTime;               // время крайнего измнения ШИМ ленты
-unsigned long ManualModeTime;             // время получения запроса через MQTT 
+unsigned long lastOnlineTime;             // время когда модуль был онлайн
+unsigned long lastCheckTime;              // время крайней проверки подключения к сервисам
+unsigned long motionTime;                 // время срабатывания датчика движения
+unsigned long lastStepTime;               // время крайнего измнения ШИМ ленты
+unsigned long manualModeTime;             // время получения запроса через MQTT 
+unsigned long dayTime;                    // время когда крайний раз был день
 
 // константы
 const int CHECK_PERIOD = 2 *  1000;       // периодичность проверки на подключение к сервисам
 const int RESTART_PERIOD = 30*60*1000;    // время до ребута, если не удается подключиться к wi-fi
 const int LIGHT_ON_TIME = 20 * 1000;      // длительность подсветки после пропадания движения
-const int PWM_TIME_STEP = 7;              // время изменения значения ШИМ 
+const int PWM_TIME_STEP = 10;             // время изменения значения ШИМ 
 const int MANUAL_TIME = 5 * 60 * 1000;    // время в ручном режиме
+const int NIGHT_TIMER = 1 *60 * 1000;     // время для фиксации признака ночь
 
 const int  linearPwmPoints[] = {0,1,2,3,4,5,6,7,8,9,
                                 10,12,14,16,18,20,23,26,29,32,
@@ -96,10 +94,9 @@ void setup()
              
   Connect_mqtt(mqtt_client_name);
   MQTT_subscribe();
-  
-  StripLedControl(OFF); //выключаем ленту
-  manual_mode_flag = false;
-  delay(1000);
+
+  targetBrightnes = OFF;
+  ledStripControl(); //выключаем ленту
 }
 
 //=========================================================================================
@@ -109,32 +106,42 @@ void loop()
   httpServer.handleClient();          // для обновления по воздуху   
   client.loop();                      // для функций MQTT 
 
+/*
   // проверка сигнала от датчиков движения
-  //bool motion_flag = Motion();
+  motion_flag = getMotionFlag();
+
+  // проверка признака ночи
+  night_flag = getNightFlag();
+*/
 
   // сбрасываем флаг ручного режима через MANUAL_TIME
-//  if ((long)millis() - ManualModeTime > MANUAL_TIME)
- //   manual_mode_flag = false; 
- /*
-  // управление светодиодной лентой
-  if (manual_mode_flag)
-    StripLedControl(targetBrightnes);
-  else
-    StripLedControl(OFF);
+  if ((long)millis() - manualModeTime > MANUAL_TIME)
+    manual_mode_flag = false; 
 
- */
-  
+  // управление светодиодной лентой
+  if (manual_mode_flag) 
+    targetBrightnes = manualBrightnes;
+  else if (motion_flag && !night_flag) 
+    targetBrightnes = DAY_LIGHT;
+  else if (motion_flag && night_flag) 
+    targetBrightnes = NIGHT_LIGHT;
+  else                  
+    targetBrightnes = OFF;
+   
+  ledStripControl();
+
+ 
   // проверка подключений к wifi и серверам
-  if ((long)millis() - LastCheckTime > CHECK_PERIOD) {
-    LastCheckTime = millis();     
+  if ((long)millis() - lastCheckTime > CHECK_PERIOD) {
+    lastCheckTime = millis();     
      
     if (WiFi.status() != WL_CONNECTED) {   
       Connect_WiFi(IP_KitchenLight, NEED_STATIC_IP); // WI-FI 
       Connect_OTA();                                 // OTA
-      Restart(LastOnlineTime, RESTART_PERIOD);     
+      Restart(lastOnlineTime, RESTART_PERIOD);     
     }
     else 
-      LastOnlineTime = millis();    
+      lastOnlineTime = millis();    
 
     if (!client.connected()) {            // MQTT
       Connect_mqtt(mqtt_client_name);
@@ -145,43 +152,52 @@ void loop()
 
 //=========================================================================================
 
+// функция определения признака ночи
+bool getNightFlag () {
+  if (digitalRead(PIN_light_sensor)) 
+    dayTime = millis(); // время когда крайний раз был день
+  
+  if ((long)millis() - dayTime < NIGHT_TIMER) 
+    return true;
+  else
+    return false;
+}
+
+//=========================================================================================
+
 // функция определения движения
-bool Motion () {
+bool getMotionFlag () {
   if (digitalRead(PIN_motion_sensor1) || digitalRead(PIN_motion_sensor2)) { 
-    MotionTime = millis(); 
+    motionTime = millis(); 
     return true; 
   }
-  if ((long)millis() - MotionTime < LIGHT_ON_TIME) 
+  else if ((long)millis() - motionTime < LIGHT_ON_TIME) 
     return true;
-         
-  return false; // если не выполнились предыдущие условия
+  else        
+    return false; 
 }
 
 
 //=========================================================================================
 
 //функция управления светодиодной лентой
-void StripLedControl (byte newBrightnes) 
+void ledStripControl () 
 {
-  if ((long)millis() - LastStepTime > PWM_TIME_STEP) {
-    LastStepTime = millis(); 
+  if ((long)millis() - lastStepTime > PWM_TIME_STEP) {
+    lastStepTime = millis(); 
 
-    if (newBrightnes > currentBrightnes)
-      currentBrightnes++;
+    if (targetBrightnes > currentBrightnes) currentBrightnes++;      
+    if (targetBrightnes < currentBrightnes) currentBrightnes--;
+    currentBrightnes = constrain(currentBrightnes, 0 , 100);
       
-    if (newBrightnes < currentBrightnes) 
-      currentBrightnes--;
-      
-    byte index = GetLightIndex(currentBrightnes);
-    analogWrite(PIN_led_strip, linearPwmPoints[index]);
+    analogWrite(PIN_led_strip, linearPwmPoints[getLightIndex(currentBrightnes)]);
   }
 }
 
 // функция преобразования яркости в процентах в индекс массива linearPwmPoints
-byte GetLightIndex (byte percent) {
-  byte index = (byte)((sizeof(linearPwmPoints) / sizeof(int)) * percent / 100 ); 
-  index = constrain(index, iMinBrightnes, iMaxBrightnes); // проверка на диапазон
-  return index;
+byte getLightIndex (byte percent) {
+  byte index = (byte)(iMaxBrightnes * percent / 100); 
+  return constrain(index, iMinBrightnes, iMaxBrightnes); // проверка на диапазон
 }
 
 
@@ -194,7 +210,8 @@ void MQTT_subscribe(void) {
 }
 
 // получение данных от сервера
-void mqtt_get(char* topic, byte* payload, unsigned int length) {
+void mqtt_get(char* topic, byte* payload, unsigned int length) 
+{
   // создаем копию полученных данных
   char localPayload[length + 1];
   for (int i=0; i<length; i++) { localPayload[i] = (char)payload[i]; }
@@ -203,9 +220,9 @@ void mqtt_get(char* topic, byte* payload, unsigned int length) {
   // присваиваем переменным значения в зависимости от топика 
   if (strcmp(topic, topicTargetBrt_ctrl) == 0) { 
     int ivalue = 0; sscanf(localPayload, "%d", &ivalue);
-    targetBrightnes = (byte)ivalue;
+    manualBrightnes = (byte)ivalue;
     manual_mode_flag = true;
-    ManualModeTime = millis(); 
+    manualModeTime = millis(); 
     MQTT_publish_int(topicTargetBrt, targetBrightnes); 
   }
 }
