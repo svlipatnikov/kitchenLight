@@ -62,7 +62,7 @@ unsigned long dayTime;                    // время когда крайни�
 const int CHECK_PERIOD = 2 *  1000;       // периодичность проверки на подключение к сервисам
 const int RESTART_PERIOD = 30*60*1000;    // время до ребута, если не удается подключиться к wi-fi
 const int LIGHT_ON_TIME = 20 * 1000;      // длительность подсветки после пропадания движения
-const int PWM_TIME_STEP = 10;             // время изменения значения ШИМ 
+const int PWM_TIME_STEP = 6;             // время изменения значения ШИМ 
 const int MANUAL_TIME = 5 * 60 * 1000;    // время в ручном режиме
 const int NIGHT_TIMER = 1 *60 * 1000;     // время для фиксации признака ночь
 
@@ -70,8 +70,8 @@ const int  linearPwmPoints[] = {0,1,2,3,4,5,6,7,8,9,
                                 10,12,14,16,18,20,23,26,29,32,
                                 36,40,44,49,54,60,66,73,81,90,
                                 100,110,121,134,148,163,180,198,218,240,
-                                265,292,322,355,391,431,475,523,576,634,
-                                698,768,845,930,1023}; // y=x*1.1
+                                265,292,322,355,391,431,475,523,576,                                
+                                634, 698,768,845, 930, 1023}; // y=x*1.1
 const byte iMaxBrightnes = sizeof(linearPwmPoints)/sizeof(int) - 1;            // максимальная яркость - индекс последнего элемента массива
 const byte iMinBrightnes = 0;                                                  // минимальная яркость - индекс первого элемента массива
 
@@ -197,7 +197,8 @@ void ledStripControl ()
 // функция преобразования яркости в процентах в индекс массива linearPwmPoints
 byte getLightIndex (byte percent) {
   byte index = (byte)(iMaxBrightnes * percent / 100); 
-  return constrain(index, iMinBrightnes, iMaxBrightnes); // проверка на диапазон
+  index = constrain(index, iMinBrightnes, iMaxBrightnes); // проверка на диапазон
+  return index;
 }
 
 
@@ -223,6 +224,6 @@ void mqtt_get(char* topic, byte* payload, unsigned int length)
     manualBrightnes = (byte)ivalue;
     manual_mode_flag = true;
     manualModeTime = millis(); 
-    MQTT_publish_int(topicTargetBrt, targetBrightnes); 
+    MQTT_publish_int(topicTargetBrt, manualBrightnes); 
   }
 }
