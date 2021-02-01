@@ -18,19 +18,20 @@
 
 #define PIN_motion_sensor1  0  // пин подключения датчика движения №1
 #define PIN_motion_sensor2  1  // пин подключения датчика движения №2
-#define PIN_led_strip       2  // пин ШИМ-сигнала для светодиодной ленты
-#define PIN_light_sensor    3  // пин подключения датчика света
+#define PIN_led_strip       3  // пин ШИМ-сигнала для светодиодной ленты
+#define PIN_light_sensor    2  // пин подключения датчика света
 
 #define  OFF          0
 #define  ON           100
-#define  NIGHT_LIGHT  15
+#define  NIGHT_LIGHT  25
 
 
 #include <ESP8266WiFi.h>
 const char ssid[] = "welcome's wi-fi";
 const char pass[] = "27101988";
 const bool NEED_STATIC_IP = true;
-IPAddress IP_KitchenLight      (192, 168, 1, 83);  
+IPAddress IP_KitchenLight      (192, 168, 1, 87);
+IPAddress IP_Cristmas          (192, 168, 1, 83);  
 IPAddress IP_Node_MCU          (192, 168, 1, 71);
 IPAddress IP_Fan_controller    (192, 168, 1, 41);
 IPAddress IP_Water_sensor_bath (192, 168, 1, 135); 
@@ -61,14 +62,18 @@ unsigned long LastStepTime;               // время крайнего изм�
 unsigned long ManualModeTime;             // время получения запроса через MQTT 
 
 // константы
-const int CHECK_PERIOD = 2 *  1000;   // периодичность проверки на подключение к сервисам
+const int CHECK_PERIOD = 2 *  1000;       // периодичность проверки на подключение к сервисам
 const int RESTART_PERIOD = 30*60*1000;    // время до ребута, если не удается подключиться к wi-fi
 const int LIGHT_ON_TIME = 20 * 1000;      // длительность подсветки после пропадания движения
-const int PWM_TIME_STEP = 20;             // время изменения значения ШИМ 
-const int MANUAL_TIME = 30 * 1000;        // время в ручном режиме
+const int PWM_TIME_STEP = 7;              // время изменения значения ШИМ 
+const int MANUAL_TIME = 5 * 60 * 1000;    // время в ручном режиме
 
-//const int  linearPwmPoints[] = {0,1,3,5,8,13,21,34,55,89,144,233,377,610,987}; // Ряд Фибоначи: нелинейный для линейного изменения яркости ленты
-const int  linearPwmPoints[] = {0,1,2,3,4,5,7,9,12,15,20,26,34,44,57,74,96,125,163,212,275,358,465,605,787,1023}; // y=x*1.3
+const int  linearPwmPoints[] = {0,1,2,3,4,5,6,7,8,9,
+                                10,12,14,16,18,20,23,26,29,32,
+                                36,40,44,49,54,60,66,73,81,90,
+                                100,110,121,134,148,163,180,198,218,240,
+                                265,292,322,355,391,431,475,523,576,634,
+                                698,768,845,930,1023}; // y=x*1.1
 const byte iMaxBrightnes = sizeof(linearPwmPoints)/sizeof(int) - 1;            // максимальная яркость - индекс последнего элемента массива
 const byte iMinBrightnes = 0;                                                  // минимальная яркость - индекс первого элемента массива
 
@@ -93,6 +98,8 @@ void setup()
   MQTT_subscribe();
   
   StripLedControl(OFF); //выключаем ленту
+  manual_mode_flag = false;
+  delay(1000);
 }
 
 //=========================================================================================
@@ -106,17 +113,16 @@ void loop()
   //bool motion_flag = Motion();
 
   // сбрасываем флаг ручного режима через MANUAL_TIME
-  if ((long)millis() - ManualModeTime > MANUAL_TIME)
-    manual_mode_flag = false; 
- 
+//  if ((long)millis() - ManualModeTime > MANUAL_TIME)
+ //   manual_mode_flag = false; 
+ /*
   // управление светодиодной лентой
   if (manual_mode_flag)
     StripLedControl(targetBrightnes);
-  else if (currentBrightnes == ON)
-    targetBrightnes = OFF;
-  else if (currentBrightnes == OFF)
-    targetBrightnes = ON;
-  StripLedControl(targetBrightnes);
+  else
+    StripLedControl(OFF);
+
+ */
   
   // проверка подключений к wifi и серверам
   if ((long)millis() - LastCheckTime > CHECK_PERIOD) {
@@ -167,7 +173,7 @@ void StripLedControl (byte newBrightnes)
       currentBrightnes--;
       
     byte index = GetLightIndex(currentBrightnes);
-    analogWrite(PIN_led_strip, 1023-linearPwmPoints[index]);
+    analogWrite(PIN_led_strip, linearPwmPoints[index]);
   }
 }
 
