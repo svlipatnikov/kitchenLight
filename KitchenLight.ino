@@ -40,14 +40,15 @@ ESP8266HTTPUpdateServer httpUpdater;
 #include <PubSubClient.h>
 WiFiClient ESP_kitchenLight;
 PubSubClient client(ESP_kitchenLight);
-const char* mqtt_client_name = "ESP_kitchenLight";    // Имя клиента MQTT
+const char* mqtt_client_name = "light_esp8266";    // Имя клиента MQTT
 
 
 //переменные
-byte currentBrightnes = OFF;              // текущая яркость
-byte targetBrightnes = OFF;               // заданная яркость
+float currentBrightnes = OFF;             // текущая яркость
+float targetBrightnes = OFF;              // заданная яркость
+float lastTargetBrightnes = OFF;          // предыдущая яркость
+float ledStartBrightnes = OFF;            // начальная яркость перед изменением на новую целевую
 byte manualBrightnes = OFF;               // яркость через mqtt
-bool manual_mode_flag = false;            // признак управления через MQTT
 bool motion_flag = false;                 // признак наличия движения
 bool night_flag = false;                  // признак ночи
 
@@ -57,46 +58,53 @@ unsigned long motionTime;                 // время срабатывания
 unsigned long lastStepTime;               // время крайнего измнения ШИМ ленты
 unsigned long manualModeTime;             // время получения запроса через MQTT 
 unsigned long dayTime;                    // время когда крайний раз был день
+unsigned long ledStartTime;               // время начала режима изменения яркости
 
 // константы
 const int CHECK_PERIOD = 2 *  1000;       // периодичность проверки на подключение к сервисам
 const int RESTART_PERIOD = 30*60*1000;    // время до ребута, если не удается подключиться к wi-fi
 const int LIGHT_ON_TIME = 20 * 1000;      // длительность подсветки после пропадания движения
-const int PWM_TIME_STEP = 6;             // время изменения значения ШИМ 
-const int MANUAL_TIME = 5 * 60 * 1000;    // время в ручном режиме
+const int PWM_TIME_STEP = 6;              // время изменения значения ШИМ 
+const int MANUAL_TIME = 30 * 60 * 1000;   // время в ручном режиме
 const int NIGHT_TIMER = 1 *60 * 1000;     // время для фиксации признака ночь
+const int CHANGE_TIME = 1000;             // время изменения яркости
 
-const int  linearPwmPoints[] = {0,1,2,3,4,5,6,7,8,9,
-                                10,12,14,16,18,20,23,26,29,32,
-                                36,40,44,49,54,60,66,73,81,90,
-                                100,110,121,134,148,163,180,198,218,240,
-                                265,292,322,355,391,431,475,523,576,                                
-                                634, 698,768,845, 930, 1023}; // y=x*1.1
-const byte iMaxBrightnes = sizeof(linearPwmPoints)/sizeof(int) - 1;            // максимальная яркость - индекс последнего элемента массива
-const byte iMinBrightnes = 0;                                                  // минимальная яркость - индекс первого элемента массива
+// линейный массив ШИМ на каждые 10%
+// const int  linearPwmPoints[] = {0,5,11,22,40,72,125,210,360,610,1023};  // old
+// const int  linearPwmPoints[] = {0,7,20,40,75,135,220,340,500,730,1023}; // new
+// const int  linearPwmPoints[] = {0,7,17,34,60,100,170,270,430,680,1023}; // new2
+const int  linearPwmPoints[] = {0,10,25,50,90,155,250,380,550,770,1023}; // new3
+
+
+
 
 //топики 
-const char topicTargetBrt[] = "/sv.lipatnikov@gmail.com/light/targetBrt";
-const char topicTargetBrt_ctrl[] = "/sv.lipatnikov@gmail.com/light/targetBrt_ctrl";
+const char topicManualBrt[] = "user_1502445e/light/manualBrt";
+const char topicManualBrt_ctrl[] = "user_1502445e/light/manualBrt_ctrl";
 
-
+const char topicTest[] = "user_1502445e/light/test";
+const char topicTest2[] = "user_1502445e/light/test2";
 
 //=========================================================================================
 void setup() 
 {
-  pinMode(PIN_led_strip, OUTPUT); 
+  pinMode(PIN_led_strip, OUTPUT);    
   pinMode(PIN_motion_sensor1, INPUT);  
   pinMode(PIN_motion_sensor2, INPUT);  
   pinMode(PIN_light_sensor, INPUT); 
+
+  // выключаем ленту
+  analogWrite(PIN_led_strip, 0);
 
   Connect_WiFi(IP_KitchenLight, NEED_STATIC_IP);
   Connect_OTA();            
              
   Connect_mqtt(mqtt_client_name);
   MQTT_subscribe();
+  MQTT_publish_int(topicManualBrt, OFF); 
+  MQTT_publish_int(topicManualBrt_ctrl, OFF);
 
-  targetBrightnes = OFF;
-  ledStripControl(); //выключаем ленту
+  
 }
 
 //=========================================================================================
@@ -114,13 +122,15 @@ void loop()
   night_flag = getNightFlag();
 */
 
-  // сбрасываем флаг ручного режима через MANUAL_TIME
-  if ((long)millis() - manualModeTime > MANUAL_TIME)
-    manual_mode_flag = false; 
+  // сбрасываем ручной режим через MANUAL_TIME
+  if (((long)millis() - manualModeTime > MANUAL_TIME) && manualBrightnes) {
+    manualBrightnes = 0;
+    MQTT_publish_int(topicManualBrt, manualBrightnes);  
+  }
 
   // управление светодиодной лентой
-  if (manual_mode_flag) 
-    targetBrightnes = manualBrightnes;
+  if (manualBrightnes) 
+    targetBrightnes = (float)manualBrightnes;
   else if (motion_flag && !night_flag) 
     targetBrightnes = DAY_LIGHT;
   else if (motion_flag && night_flag) 
@@ -180,50 +190,45 @@ bool getMotionFlag () {
 
 //=========================================================================================
 
-//функция управления светодиодной лентой
-void ledStripControl () 
-{
-  if ((long)millis() - lastStepTime > PWM_TIME_STEP) {
-    lastStepTime = millis(); 
 
-    if (targetBrightnes > currentBrightnes) currentBrightnes++;      
-    if (targetBrightnes < currentBrightnes) currentBrightnes--;
-    currentBrightnes = constrain(currentBrightnes, 0 , 100);
-      
-    analogWrite(PIN_led_strip, linearPwmPoints[getLightIndex(currentBrightnes)]);
+bool flag = false;
+
+// управление лентой
+void ledStripControl () {  
+  unsigned long currentTime = millis(); // текущее время
+  
+  if (targetBrightnes != lastTargetBrightnes) {
+    lastTargetBrightnes = targetBrightnes;
+    ledStartTime = currentTime;
+    ledStartBrightnes = currentBrightnes; 
+
+    MQTT_publish_str(topicTest, "start");
+    flag = true;
+  }
+
+
+
+  if (currentTime - ledStartTime < CHANGE_TIME) {
+//    float koef = currentTime - ledStartTime * 1000 / CHANGE_TIME; 
+    float koef = ((currentTime - ledStartTime) * 1000 / CHANGE_TIME);
+    currentBrightnes = ledStartBrightnes + (targetBrightnes - ledStartBrightnes) * koef / 1000;
+    currentBrightnes = constrain(currentBrightnes, 0, 100);   
+    analogWrite(PIN_led_strip, getPWMvalue(currentBrightnes));   
+  }  
+  else if (flag == true)
+  {
+    MQTT_publish_str(topicTest, "End"); 
+    flag = false;
   }
 }
 
-// функция преобразования яркости в процентах в индекс массива linearPwmPoints
-byte getLightIndex (byte percent) {
-  byte index = (byte)(iMaxBrightnes * percent / 100); 
-  index = constrain(index, iMinBrightnes, iMaxBrightnes); // проверка на диапазон
-  return index;
-}
+// функция получения значения PWM из массива linearPwmPoints
+int getPWMvalue(float brt) {
+  byte indexMin = (byte)floor(brt/10);   
+  byte indexMax = (byte)ceil(brt/10);
 
-
-//=========================================================================================
-//функции MQTT
-
-// функция подписки на топики 
-void MQTT_subscribe(void) {
-  client.subscribe(topicTargetBrt_ctrl);      
-}
-
-// получение данных от сервера
-void mqtt_get(char* topic, byte* payload, unsigned int length) 
-{
-  // создаем копию полученных данных
-  char localPayload[length + 1];
-  for (int i=0; i<length; i++) { localPayload[i] = (char)payload[i]; }
-  localPayload[length] = 0;
-
-  // присваиваем переменным значения в зависимости от топика 
-  if (strcmp(topic, topicTargetBrt_ctrl) == 0) { 
-    int ivalue = 0; sscanf(localPayload, "%d", &ivalue);
-    manualBrightnes = (byte)ivalue;
-    manual_mode_flag = true;
-    manualModeTime = millis(); 
-    MQTT_publish_int(topicTargetBrt, manualBrightnes); 
-  }
+  float percent = (brt - (indexMin * 10)) / 10;
+  int pwm = round(linearPwmPoints[indexMin] + (linearPwmPoints[indexMax] - linearPwmPoints[indexMin]) * percent);
+  pwm = constrain(pwm, 0, 1023);
+  return pwm;
 }
