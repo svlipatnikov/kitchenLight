@@ -16,7 +16,7 @@ void Connect_mqtt(const char* client_name) {
 
 // Функция отправки int или bool на сревер mqtt
 void MQTT_publish_int(const char* topic , int data){
-  char msg[5];
+  char msg[10];
   sprintf (msg, "%u", data);    
   client.publish(topic, msg, true);
 }
@@ -55,8 +55,9 @@ void mqtt_get(char* topic, byte* payload, unsigned int length)
   // присваиваем переменным значения в зависимости от топика 
   if (strcmp(topic, topicManualBrt_ctrl) == 0) { 
     int ivalue = 0; sscanf(localPayload, "%d", &ivalue);
-    manualBrightnes = (byte)ivalue;
+    manualBrightnes = (float)ivalue;    
     manualModeTime = millis(); 
+    manualBrightnes ? manual_flag = true : manual_flag = false;  
     MQTT_publish_int(topicManualBrt, manualBrightnes); 
   }
 }
