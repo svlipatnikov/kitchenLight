@@ -41,7 +41,8 @@ void MQTT_publish_str(const char* topic , char* data){
 
 // функция подписки на топики 
 void MQTT_subscribe(void) {
-  client.subscribe(topicManualBrt_ctrl);      
+  client.subscribe(topicManualBrt_ctrl); 
+  client.subscribe(topicOffMode_ctrl);      
 }
 
 // получение данных от сервера
@@ -59,5 +60,13 @@ void mqtt_get(char* topic, byte* payload, unsigned int length)
     manualModeTime = millis(); 
     manualBrightnes ? manual_flag = true : manual_flag = false;  
     MQTT_publish_int(topicManualBrt, manualBrightnes); 
+    if (manual_flag) MQTT_publish_str(topicTest, "manual_flag");
   }
+  if (strcmp(topic, topicOffMode_ctrl) == 0) { 
+    int ivalue = 0; sscanf(localPayload, "%d", &ivalue);
+    off_flag = (bool)ivalue;
+    MQTT_publish_int(topicOffMode, off_flag); 
+    if (off_flag) MQTT_publish_str(topicTest, "off_flag");
+  }
+  
 }

@@ -41,6 +41,11 @@ PubSubClient client(ESP_kitchenLight);
 const char* mqtt_client_name = "light_esp8266";    // Имя клиента MQTT
 
 
+#include <NTPClient.h>
+WiFiUDP Udp2;
+NTPClient timeClient(Udp2, "europe.pool.ntp.org");
+
+
 //переменные
 float currentBrightnes = OFF;             // текущая яркость
 float targetBrightnes = OFF;              // заданная яркость
@@ -51,6 +56,8 @@ float manualBrightnes = OFF;              // яркость через mqtt
 bool motion_flag = false;                 // признак наличия движения
 bool night_flag = false;                  // признак ночи
 bool manual_flag = false;                 // признак руного режима
+bool off_flag = false;                    // признак отключенного режима
+bool ntp_night_flag = false;              // призак ночи по через ntp
 
 unsigned long lastOnlineTime;             // время когда модуль был онлайн
 unsigned long lastCheckTime;              // время крайней проверки подключения к сервисам
@@ -60,16 +67,19 @@ unsigned long dayTime;                    // время когда крайни�
 unsigned long ledStartTime;               // время начала режима изменения яркости
 unsigned long currentTime;                // текущее время
 unsigned long getFlagTime;                // время вычисления флагов
+unsigned long Last_get_ntp_time;          // время крайнего получения вермени NTP
 
 // константы
 const int CHECK_PERIOD = 1 *  1000;       // периодичность проверки на подключение к сервисам
-const int GET_FLAG_PERIOD = 100;          // период вычисления флагов
+const int GET_FLAG_PERIOD = 50;           // период вычисления флагов
 const int RESTART_PERIOD = 30*60*1000;    // время до ребута, если не удается подключиться к wi-fi
-const int MOTION_TIMER = 15 * 1000;       // длительность подсветки после пропадания движения
+const int MOTION_TIMER = 60 * 1000;       // длительность подсветки после пропадания движения
 const int PWM_TIME_STEP = 6;              // время изменения значения ШИМ 
 const int MANUAL_TIMER = 10 * 60 * 1000;  // время в ручном режиме
 const int NIGHT_TIMER = 1 *60 * 1000;     // время для фиксации признака ночь
-const int CHANGE_TIME = 1000;             // время изменения яркости
+const int UP_CHANGE_TIME = 1000;          // время изменения яркости на включение
+const int DOWN_CHANGE_TIME = 5000;        // время изменения яркости на выключение
+const int GET_NTP_TIME_PERIOD = 60*1000;  // период получения времни с сервера NTP
 
 // линейный массив ШИМ на каждые 10%
 const int  linearPwmPoints[] = {0,10,25,50,90,155,250,380,550,770,1023}; // new3
@@ -78,6 +88,9 @@ const int  linearPwmPoints[] = {0,10,25,50,90,155,250,380,550,770,1023}; // new3
 //топики 
 const char topicManualBrt[] = "user_1502445e/light/manualBrt";
 const char topicManualBrt_ctrl[] = "user_1502445e/light/manualBrt_ctrl";
+
+const char topicOffMode[] = "user_1502445e/light/offMode";
+const char topicOffMode_ctrl[] = "user_1502445e/light/offMode_ctrl";
 
 const char topicTest[] = "user_1502445e/light/test";
 const char topicTest2[] = "user_1502445e/light/test2";
@@ -94,17 +107,26 @@ void setup()
   analogWrite(PIN_led_strip, 0);
 
   Connect_WiFi(IP_KitchenLight, NEED_STATIC_IP);
-  Connect_OTA();            
-             
+  Connect_OTA();                 
   Connect_mqtt(mqtt_client_name);
+  
   MQTT_subscribe();
   MQTT_publish_int(topicManualBrt, OFF); 
   MQTT_publish_int(topicManualBrt_ctrl, OFF); 
+
+  timeClient.begin();
+  timeClient.setTimeOffset(4*60*60);   //смещение на UTC+4
 }
 
 //=========================================================================================
 void loop() 
 {
+  // получение признака Ночь через NTP
+  if ((long)millis() - Last_get_ntp_time > GET_NTP_TIME_PERIOD) {
+    Last_get_ntp_time = millis(); 
+    ntp_night_flag = getNtpNightFlag();
+  } 
+  
   // сетевые функции
   httpServer.handleClient();          // для обновления по воздуху   
   client.loop();                      // для функций MQTT 
@@ -127,10 +149,14 @@ void loop()
   }
 
   // управление светодиодной лентой
-  if (manual_flag)
+  if (off_flag)
+    ledStripControl(OFF);
+  else if (manual_flag)
     ledStripControl(manualBrightnes);
-  else if (motion_flag)
-    ledStripControl(DAY_LIGHT);
+  else if (motion_flag) {
+    int brightnes = (night_flag || ntp_night_flag) ? NIGHT_LIGHT : DAY_LIGHT;
+    ledStripControl(brightnes);
+  }
   else                   
     ledStripControl(OFF);
    
@@ -155,26 +181,49 @@ void loop()
 
 //=========================================================================================
 
-// функция определения признака ночи
+// функции определения признака ночи
 bool getNightFlag () {
-  if (digitalRead(PIN_light_sensor)) 
-    dayTime = currentTime; // время когда крайний раз был день
-  
-  if (currentTime - dayTime < NIGHT_TIMER) 
-    return true;
-  else
-    return false;
+  if (digitalRead(PIN_light_sensor)) dayTime = millis(); // время когда крайний раз был день 
+  if (currentTime - dayTime < NIGHT_TIMER) return true;
+  return false;
+}
+
+bool getNtpNightFlag () {
+  timeClient.update();
+  if ((timeClient.getHours() >= 22) || (timeClient.getHours() <= 6)) return true;
+  return false;
 }
 
 //=========================================================================================
 
+byte pir1_counter = 0;
+byte pir2_counter = 0;
+
 // функция определения движения
-bool getMotionFlag () {  
-  if (digitalRead(PIN_motion_sensor1) || digitalRead(PIN_motion_sensor2)) 
+bool getMotionFlag () { 
+  if (digitalRead(PIN_motion_sensor1)) 
+    pir1_counter++;
+  else
+    pir1_counter = 0;
+    
+  if (digitalRead(PIN_motion_sensor2)) 
+    pir2_counter++;
+  else
+    pir2_counter = 0;
+  
+  //bool pir1 = digitalRead(PIN_motion_sensor1);
+  //bool pir2 = digitalRead(PIN_motion_sensor2);
+
+  if (pir1_counter > 2 || pir2_counter > 2) 
     motionTime = currentTime;
   
-  if (currentTime - motionTime < MOTION_TIMER) 
+  if (currentTime - motionTime < MOTION_TIMER) {
+    if (!motion_flag) { 
+      if (pir1_counter > 2) MQTT_publish_str(topicTest, "motion_flag pir1");
+      if (pir2_counter > 2) MQTT_publish_str(topicTest, "motion_flag pir2");
+    }
     return true;
+  }
   else
     return false;
 }
@@ -191,8 +240,10 @@ void ledStripControl (float brt) {
     ledStartBrightnes = currentBrightnes; 
   }
 
-  if (currentTime - ledStartTime < CHANGE_TIME) {
-    float koef = ((currentTime - ledStartTime) * 1000 / CHANGE_TIME);
+  int changeTime = (targetBrightnes > ledStartBrightnes) ? UP_CHANGE_TIME : DOWN_CHANGE_TIME;
+
+  if (currentTime - ledStartTime < changeTime) {
+    float koef = ((currentTime - ledStartTime) * 1000 / changeTime);
     currentBrightnes = ledStartBrightnes + (targetBrightnes - ledStartBrightnes) * koef / 1000;
     currentBrightnes = constrain(currentBrightnes, 0, 100);   
     analogWrite(PIN_led_strip, getPWMvalue(currentBrightnes));   
